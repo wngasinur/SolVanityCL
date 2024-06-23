@@ -10,3 +10,5 @@ RUN apt-get update -y \
 RUN pip install -r ./vanity/requirements.txt
 
 RUN mkdir -p /etc/OpenCL/vendors && echo libnvidia-opencl.so.1 >> /etc/OpenCL/vendors/nvidia.icd
+
+WORKDIR /workspace/vanity

@@ -26,7 +26,12 @@ load_dotenv()
 
 from message import r
 import json
+import runpod
 
+runpod.api_key = os.environ["RUNPOD_API_KEY"]
+
+topic = os.environ["TOPIC"]
+print(f"Subscriber topic {topic}")
 logging.basicConfig(level="INFO", format="[%(levelname)s %(asctime)s] %(message)s")
 
 
@@ -136,10 +141,11 @@ def save_result(outputs, output_dir):
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         key = b58encode(bytes(list(pv_bytes + pb_bytes))).decode()
         json_keys = json.dumps({"key": key, "pubkey": pubkey})
-        r.publish("posts", json_keys)
+        r.publish(topic, json_keys)
         Path(output_dir, f"{pubkey}.json").write_text(
             key
         )
+        runpod.terminate_pod(os.environ["RUNPOD_POD_ID"])
     return result_count
 
 
