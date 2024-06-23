@@ -11,7 +11,6 @@ typedef int32_t fe[10];
 
 constant uchar PREFIX[] = {83, 111, 76};
 constant uchar SUFFIX[] = {};
-constant bool IGNORE_CASE_SENSITIVE = true;
 
 static uint64_t load_3(const unsigned char *in) {
   uint64_t result;
@@ -5041,19 +5040,6 @@ static uchar *base58_encode(uchar *in, size_t *out_len) {
   return out;
 }
 
-static char *cl_strtolower(constant uchar *input, size_t inputLength, uchar *output) {
-    int maxChars = (inputLength < 256) ? (int)inputLength : 256;
-    for (int i = 0; i < maxChars; i++) {
-        unsigned char c = (unsigned char)input[i];
-        if (c >= 'A' && c <= 'Z') {
-            c += 'a' - 'A';
-        }
-        output[i] = c;
-    }  
-    output[maxChars] = '\0';
-    return output;
-}
-
 __kernel void generate_pubkey(constant uchar *seed, global uchar *out,
                               global uchar *occupied_bytes,
                               global uchar *group_offset) {
@@ -5075,31 +5061,14 @@ __kernel void generate_pubkey(constant uchar *seed, global uchar *out,
 
   // pattern match
   size_t prefix_len = sizeof(PREFIX), suffix_len = sizeof(SUFFIX);
-  uchar SUFFIX_LOWER[256];
-  uchar PREFIX_LOWER[256];
-
-  cl_strtolower(SUFFIX, suffix_len, SUFFIX_LOWER);
-  cl_strtolower(PREFIX, prefix_len, PREFIX_LOWER);
-
   for (size_t i = 0; i < suffix_len; i++) {
-    /*if (addr[length - suffix_len + i] != SUFFIX[i])*/
-     if(IGNORE_CASE_SENSITIVE) {   
-        if (addr[length - suffix_len + i] != SUFFIX[i]  && addr[length - suffix_len + i] != SUFFIX_LOWER[i])
-            return;
-     } else {   
-            if (addr[length - suffix_len + i] != SUFFIX[i])
-                return;
-        }
-  } 
+    if (addr[length - suffix_len + i] != SUFFIX[i])
+      return;
+  }
+
   for (size_t i = 0; i < prefix_len; i++) {
-    /*if (addr[i] != PREFIX[i])*/
-      if(IGNORE_CASE_SENSITIVE) {
-          if (addr[i] != PREFIX[i] && addr[i] != PREFIX_LOWER[i])
-             return;
-      } else {
-            if (addr[i] != PREFIX[i])
-                return;
-        }
+    if (addr[i] != PREFIX[i])
+      return;
   }
 
   // assign to out
