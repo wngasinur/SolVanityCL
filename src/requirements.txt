@@ -3,3 +3,5 @@ pyopencl
 base58
 PyNaCl
 multiprocess
+redis
+python-dotenv

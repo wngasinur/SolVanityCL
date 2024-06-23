@@ -20,6 +20,13 @@ import numpy as np
 from base58 import b58decode, b58encode
 from nacl.signing import SigningKey
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from message import r
+import json
+
 logging.basicConfig(level="INFO", format="[%(levelname)s %(asctime)s] %(message)s")
 
 
@@ -127,8 +134,11 @@ def save_result(outputs, output_dir):
 
         logging.info(f"Found: {pubkey}")
         Path(output_dir).mkdir(parents=True, exist_ok=True)
+        key = b58encode(bytes(list(pv_bytes + pb_bytes))).decode()
+        json_keys = json.dumps({"key": key, "pubkey": pubkey})
+        r.publish("posts", json_keys)
         Path(output_dir, f"{pubkey}.json").write_text(
-            json.dumps(list(pv_bytes + pb_bytes))
+            key
         )
     return result_count
 

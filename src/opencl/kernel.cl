@@ -4993,7 +4993,7 @@ void ed25519_create_keypair(unsigned char *public_key,
 }
 
 constant uchar alphabet[] =
-    "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 static uchar *base58_encode(uchar *in, size_t *out_len) {
   size_t in_len = 32, out_length;
