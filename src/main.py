@@ -8,6 +8,7 @@ import time
 from itertools import product
 from math import ceil
 from multiprocessing.pool import Pool
+from datetime import datetime, timedelta
 
 import pyopencl as cl
 
@@ -27,13 +28,38 @@ load_dotenv()
 from message import r
 import json
 import runpod
+import threading
 
 runpod.api_key = os.environ["RUNPOD_API_KEY"]
 
+global_attempt = 0
+terminate_time = datetime.now()
 topic = os.environ["TOPIC"]
-print(f"Subscriber topic {topic}")
+terminate_seconds = int(os.environ["TERMINATE_SECONDS"])
+print(f"Subscriber topic {topic}, terminating in {terminate_seconds} seconds")
 logging.basicConfig(level="INFO", format="[%(levelname)s %(asctime)s] %(message)s")
 
+
+def terminate_function():
+    global terminate_time
+    terminate_time = datetime.now() + timedelta(seconds=terminate_seconds)
+    time.sleep(terminate_seconds)
+    logging.info("Thread %s: terminate_function timeout")
+    publish(json.dumps({"state": "timeout"}))
+    runpod.terminate_pod(os.environ["RUNPOD_POD_ID"])
+
+
+x1 = threading.Thread(target=terminate_function, daemon=True)
+x1.start()
+
+def publish(message):
+    try:
+        r.publish(topic, message)
+    except Exception as e:
+        print(e)
+        runpod.terminate_pod(os.environ["RUNPOD_POD_ID"])
+
+publish(json.dumps({"state": "start"}))
 
 class HostSetting:
     def __init__(self, kernel_source: str, iteration_bits: int) -> None:
@@ -72,8 +98,11 @@ def check_character(name: str, character: str):
         b58decode(character)
     except ValueError as e:
         logging.error(f"{str(e)} in {name}")
+        publish(json.dumps({"state": "error", "message": str(e)}))
+        runpod.terminate_pod(os.environ["RUNPOD_POD_ID"])
         sys.exit(1)
     except Exception as e:
+        publish(json.dumps({"state": "warning", "message": str(e)}))
         raise e
 
 
@@ -141,7 +170,8 @@ def save_result(outputs, output_dir):
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         key = b58encode(bytes(list(pv_bytes + pb_bytes))).decode()
         json_keys = json.dumps({"key": key, "pubkey": pubkey})
-        r.publish(topic, json_keys)
+        # r.publish(topic, json_keys)
+        publish(json_keys)
         Path(output_dir, f"{pubkey}.json").write_text(
             key
         )
@@ -183,6 +213,7 @@ class Searcher:
         return valid_outputs
 
     def find(self):
+        # global global_attempt
         memobj_key32 = cl.Buffer(
             self.context,
             cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
@@ -218,8 +249,10 @@ class Searcher:
             (self.setting.local_work_size,),
         )
         cl._enqueue_read_buffer(self.command_queue, memobj_output, output).wait()
+        speed = f"{global_worker_size/ ((time.time() - st) * 10**6):.2f}"
+        # global_attempt += float(speed)
         logging.info(
-            f"GPU {self.index} Speed: {global_worker_size/ ((time.time() - st) * 10**6):.2f} MH/s"
+            f"GPU {self.index} Speed: {speed} MH/s"
         )
 
         return output
@@ -298,6 +331,19 @@ def search_pubkey(
     result_count = 0
 
     logging.info(f"Searching with {gpu_counts} OpenCL devices")
+    publish(json.dumps({"state": "progress"}))
+
+    def heartbeat_function():
+        global global_attempt, terminate_time, terminate_seconds
+        while True:
+            y = terminate_time - datetime.now()
+            elapsedTime = terminate_seconds - y.seconds
+            publish(json.dumps({"attempt": str(round(global_attempt,2)), "elapsedTime": elapsedTime, "maxTime": terminate_seconds}))
+            time.sleep(5)
+
+    x2 = threading.Thread(target=heartbeat_function, daemon=True)
+    x2.start()
+
     if select_device:
         context = cl.create_some_context()
         searcher = Searcher(
