@@ -35,6 +35,7 @@ runpod.api_key = os.environ["RUNPOD_API_KEY"]
 global_attempt = 0
 terminate_time = datetime.now()
 topic = os.environ["TOPIC"]
+chars = os.environ["CHARS"]
 terminate_seconds = int(os.environ["TERMINATE_SECONDS"])
 print(f"Subscriber topic {topic}, terminating in {terminate_seconds} seconds")
 logging.basicConfig(level="INFO", format="[%(levelname)s %(asctime)s] %(message)s")
@@ -45,21 +46,24 @@ def terminate_function():
     terminate_time = datetime.now() + timedelta(seconds=terminate_seconds)
     time.sleep(terminate_seconds)
     logging.info("Thread %s: terminate_function timeout")
-    publish(json.dumps({"state": "timeout"}))
+    publish(json.dumps({"state": "timeout"}), "timeout")
     runpod.terminate_pod(os.environ["RUNPOD_POD_ID"])
 
 
 x1 = threading.Thread(target=terminate_function, daemon=True)
 x1.start()
 
-def publish(message):
+def publish(message, state = None):
     try:
+        # start/timeout/error/warning/progress/completed
+        if state is not None:
+            r.set(f"runpod-{topic}-{chars}-stat", state)
         r.publish(topic, message)
     except Exception as e:
         print(e)
         runpod.terminate_pod(os.environ["RUNPOD_POD_ID"])
 
-publish(json.dumps({"state": "start"}))
+publish(json.dumps({"state": "start"}) ,"start")
 
 class HostSetting:
     def __init__(self, kernel_source: str, iteration_bits: int) -> None:
@@ -98,11 +102,11 @@ def check_character(name: str, character: str):
         b58decode(character)
     except ValueError as e:
         logging.error(f"{str(e)} in {name}")
-        publish(json.dumps({"state": "error", "message": str(e)}))
+        publish(json.dumps({"state": "error", "message": str(e)}) , "error")
         runpod.terminate_pod(os.environ["RUNPOD_POD_ID"])
         sys.exit(1)
     except Exception as e:
-        publish(json.dumps({"state": "warning", "message": str(e)}))
+        publish(json.dumps({"state": "warning", "message": str(e)}) , "warning")
         raise e
 
 
@@ -170,8 +174,8 @@ def save_result(outputs, output_dir):
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         key = b58encode(bytes(list(pv_bytes + pb_bytes))).decode()
         json_keys = json.dumps({"key": key, "pubkey": pubkey})
-        # r.publish(topic, json_keys)
-        publish(json_keys)
+        
+        publish(json_keys, "completed")
         Path(output_dir, f"{pubkey}.json").write_text(
             key
         )
@@ -331,7 +335,7 @@ def search_pubkey(
     result_count = 0
 
     logging.info(f"Searching with {gpu_counts} OpenCL devices")
-    publish(json.dumps({"state": "progress"}))
+    publish(json.dumps({"state": "progress"}) ,"progress")
 
     def heartbeat_function():
         global global_attempt, terminate_time, terminate_seconds
