@@ -56,9 +56,12 @@ x1.start()
 def publish(message, state=None):
     try:
         # start/timeout/error/warning/progress/completed
-        if state is not None:
+        previous_state = r.get(f"runpod-{topic}-{chars}-stat")
+        if previous_state == "completed":
+            raise RuntimeError("Already completed")
+        elif state is not None:
             r.set(f"runpod-{topic}-{chars}-stat", state)
-        r.publish(topic, message)
+            r.publish(topic, message)
     except Exception as e:
         print(e)
         runpod.terminate_pod(os.environ["RUNPOD_POD_ID"])
