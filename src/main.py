@@ -36,6 +36,7 @@ terminate_time = datetime.now()
 topic = os.environ["TOPIC"]
 chars = os.environ["CHARS"]
 terminate_seconds = int(os.environ["TERMINATE_SECONDS"])
+print("Version 1.0")
 print(f"Subscriber topic {topic}, terminating in {terminate_seconds} seconds")
 logging.basicConfig(level="INFO", format="[%(levelname)s %(asctime)s] %(message)s")
 
@@ -61,7 +62,8 @@ def publish(message, state=None):
             raise RuntimeError("Already completed")
         elif state is not None:
             r.set(f"runpod-{topic}-{chars}-stat", state)
-            r.publish(topic, message)
+
+        r.publish(topic, message)
     except Exception as e:
         print(e)
         runpod.terminate_pod(os.environ["RUNPOD_POD_ID"])
