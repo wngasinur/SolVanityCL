@@ -24,6 +24,7 @@ from nacl.signing import SigningKey
 load_dotenv()
 
 import threading
+from datetime import datetime, timedelta
 
 import runpod
 
@@ -58,10 +59,12 @@ def publish(message, state=None):
     try:
         # start/timeout/error/warning/progress/completed
         previous_state = r.get(f"runpod-{topic}-{chars}-stat")
-        if previous_state == "completed":
+        if state != "completed" and previous_state == "completed":
             raise RuntimeError("Already completed")
         elif state is not None:
             r.set(f"runpod-{topic}-{chars}-stat", state)
+            if state == "completed":
+                r.set(f"runpod-{topic}-last", message)
 
         r.publish(topic, message)
     except Exception as e:
