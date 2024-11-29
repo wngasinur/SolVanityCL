@@ -5,7 +5,7 @@ import platform
 import secrets
 import sys
 import time
-from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 from math import ceil
 from multiprocessing.pool import Pool
 
@@ -136,6 +136,9 @@ def get_kernel_source(starts_with: str, ends_with: str, cl):
 
     source_str = "".join(source_lines)
 
+    if "NVIDIA" in str(cl.get_platforms()) and platform.system() == "Windows":
+        source_str = source_str.replace("#define __generic\n", "")
+
     if cl.get_cl_header_version()[0] != 1 and platform.system() != "Windows":
         source_str = source_str.replace("#define __generic\n", "")
 
@@ -149,6 +152,16 @@ def get_all_gpu_devices():
         for device in platform.get_devices(device_type=cl.device_type.GPU)
     ]
     return [d.int_ptr for d in devices]
+
+
+def single_gpu_init(context, setting):
+    searcher = Searcher(
+        kernel_source=setting.kernel_source,
+        index=0,
+        setting=setting,
+        context=context,
+    )
+    return [searcher.find()]
 
 
 def multi_gpu_init(index: int, setting: HostSetting):
@@ -364,17 +377,14 @@ def search_pubkey(
     x2.start()
 
     if select_device:
-        context = cl.create_some_context()
-        searcher = Searcher(
-            kernel_source=setting.kernel_source,
-            index=0,
-            setting=setting,
-            context=context,
-        )
-        while result_count < count:
-            output = searcher.find()
-            setting.increase_key32()
-            result_count += save_result([output], output_dir)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            context = cl.create_some_context()
+            while result_count < count:
+                future = executor.submit(single_gpu_init, context, setting)
+                result = future.result()
+                result_count += save_result(result, output_dir)
+                setting.increase_key32()
+                time.sleep(0.1)
         return
 
     with Pool(processes=gpu_counts) as pool:
@@ -393,10 +403,10 @@ def show_device():
 
     platforms = cl.get_platforms()
 
-    for p_index, platform in enumerate(platforms):
-        print(f"Platform {p_index}: {platform.name}")
+    for p_index, platform_ in enumerate(platforms):
+        print(f"Platform {p_index}: {platform_.name}")
 
-        devices = platform.get_devices()
+        devices = platform_.get_devices()
 
         for d_index, device in enumerate(devices):
             print(f"- Device {d_index}: {device.name}")
