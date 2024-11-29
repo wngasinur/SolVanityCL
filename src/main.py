@@ -5,10 +5,9 @@ import platform
 import secrets
 import sys
 import time
-from itertools import product
+from datetime import datetime, timedelta
 from math import ceil
 from multiprocessing.pool import Pool
-from datetime import datetime, timedelta
 
 import pyopencl as cl
 
@@ -19,16 +18,16 @@ from pathlib import Path
 import click
 import numpy as np
 from base58 import b58decode, b58encode
-from nacl.signing import SigningKey
-
 from dotenv import load_dotenv
+from nacl.signing import SigningKey
 
 load_dotenv()
 
-from message import r
-import json
-import runpod
 import threading
+
+import runpod
+
+from message import r
 
 runpod.api_key = os.environ["RUNPOD_API_KEY"]
 
@@ -53,7 +52,8 @@ def terminate_function():
 x1 = threading.Thread(target=terminate_function, daemon=True)
 x1.start()
 
-def publish(message, state = None):
+
+def publish(message, state=None):
     try:
         # start/timeout/error/warning/progress/completed
         if state is not None:
@@ -63,7 +63,9 @@ def publish(message, state = None):
         print(e)
         runpod.terminate_pod(os.environ["RUNPOD_POD_ID"])
 
-publish(json.dumps({"state": "start"}) ,"start")
+
+publish(json.dumps({"state": "start"}), "start")
+
 
 class HostSetting:
     def __init__(self, kernel_source: str, iteration_bits: int) -> None:
@@ -102,11 +104,11 @@ def check_character(name: str, character: str):
         b58decode(character)
     except ValueError as e:
         logging.error(f"{str(e)} in {name}")
-        publish(json.dumps({"state": "error", "message": str(e)}) , "error")
+        publish(json.dumps({"state": "error", "message": str(e)}), "error")
         runpod.terminate_pod(os.environ["RUNPOD_POD_ID"])
         sys.exit(1)
     except Exception as e:
-        publish(json.dumps({"state": "warning", "message": str(e)}) , "warning")
+        publish(json.dumps({"state": "warning", "message": str(e)}), "warning")
         raise e
 
 
@@ -174,11 +176,14 @@ def save_result(outputs, output_dir):
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         key = b58encode(bytes(list(pv_bytes + pb_bytes))).decode()
         json_keys = json.dumps({"key": key, "pubkey": pubkey})
-        
+
         publish(json_keys, "completed")
-        Path(output_dir, f"{pubkey}.json").write_text(
-            key
-        )
+        time.sleep(3)
+        publish(json_keys, "completed")
+        time.sleep(5)
+        publish(json_keys, "completed")
+
+        Path(output_dir, f"{pubkey}.json").write_text(key)
         runpod.terminate_pod(os.environ["RUNPOD_POD_ID"])
     return result_count
 
@@ -187,7 +192,6 @@ class Searcher:
     def __init__(
         self, *, kernel_source, index: int, setting: HostSetting, context=None
     ):
-
         device_ids = get_all_gpu_devices()
         # context and command queue
         if context:
@@ -255,9 +259,7 @@ class Searcher:
         cl._enqueue_read_buffer(self.command_queue, memobj_output, output).wait()
         speed = f"{global_worker_size/ ((time.time() - st) * 10**6):.2f}"
         # global_attempt += float(speed)
-        logging.info(
-            f"GPU {self.index} Speed: {speed} MH/s"
-        )
+        logging.info(f"GPU {self.index} Speed: {speed} MH/s")
 
         return output
 
@@ -335,14 +337,22 @@ def search_pubkey(
     result_count = 0
 
     logging.info(f"Searching with {gpu_counts} OpenCL devices")
-    publish(json.dumps({"state": "progress"}) ,"progress")
+    publish(json.dumps({"state": "progress"}), "progress")
 
     def heartbeat_function():
         global global_attempt, terminate_time, terminate_seconds
         while True:
             y = terminate_time - datetime.now()
             elapsedTime = terminate_seconds - y.seconds
-            publish(json.dumps({"attempt": str(round(global_attempt,2)), "elapsedTime": elapsedTime, "maxTime": terminate_seconds}))
+            publish(
+                json.dumps(
+                    {
+                        "attempt": str(round(global_attempt, 2)),
+                        "elapsedTime": elapsedTime,
+                        "maxTime": terminate_seconds,
+                    }
+                )
+            )
             time.sleep(5)
 
     x2 = threading.Thread(target=heartbeat_function, daemon=True)
