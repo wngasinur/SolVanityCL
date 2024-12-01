@@ -5071,7 +5071,21 @@ __kernel void generate_pubkey(constant uchar *seed, global uchar *out,
   }
 
   for (size_t i = 0; i < prefix_len; i++) {
-    if (addr[i] != PREFIX[i])
+    uchar addr_char = addr[i];
+    uchar prefix_char = PREFIX[i];
+    
+    if (sizeof(PREFIX) >=5) {
+      // Convert both characters to uppercase for comparison
+      if (addr_char >= 'a' && addr_char <= 'z') {
+        addr_char -= 32;  // Convert lowercase to uppercase
+      }
+      if (prefix_char >= 'a' && prefix_char <= 'z') {
+        prefix_char -= 32;  // Convert lowercase to uppercase
+      }
+    }
+    
+    
+    if (addr_char != prefix_char)
       return;
   }
 
