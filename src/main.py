@@ -119,7 +119,7 @@ def check_character(name: str, character: str):
         raise e
 
 
-def get_kernel_source(starts_with: str, ends_with: str, cl):
+def get_kernel_source(starts_with: str, ends_with: str, case_sensitive: int, cl):
     PREFIX_BYTES = list(bytes(starts_with.encode()))
     SUFFIX_BYTES = list(bytes(ends_with.encode()))
 
@@ -135,6 +135,8 @@ def get_kernel_source(starts_with: str, ends_with: str, cl):
             source_lines[i] = (
                 f"constant uchar SUFFIX[] = {{{', '.join(map(str, SUFFIX_BYTES))}}};\n"
             )
+        if s.startswith("constant int CASE_SENSITIVE"):
+            source_lines[i] = f"constant int CASE_SENSITIVE = {{{case_sensitive}}};\n"
 
     source_str = "".join(source_lines)
 
@@ -290,6 +292,12 @@ def cli():
     default="",
 )
 @click.option(
+    "--case-sensitive",
+    type=int,
+    help="",
+    default=1,
+)
+@click.option(
     "--count",
     type=int,
     help="Count of pubkeys to generate.",
@@ -318,6 +326,7 @@ def search_pubkey(
     ctx,
     starts_with: str,
     ends_with: str,
+    case_sensitive: int,
     count: int,
     output_dir: str,
     select_device: bool,
@@ -339,7 +348,7 @@ def search_pubkey(
     with Pool() as pool:
         gpu_counts = len(pool.apply(get_all_gpu_devices))
 
-    kernel_source = get_kernel_source(starts_with, ends_with, cl)
+    kernel_source = get_kernel_source(starts_with, ends_with, case_sensitive, cl)
     setting = HostSetting(kernel_source, iteration_bits)
     result_count = 0
 
@@ -360,7 +369,12 @@ def search_pubkey(
                     }
                 )
             )
-            time.sleep(5)
+            if len(chars) >= 6:
+                time.sleep(30)
+            elif len(chars) >= 5:
+                time.sleep(15)
+            else:
+                time.sleep(7)
 
     x2 = threading.Thread(target=heartbeat_function, daemon=True)
     x2.start()

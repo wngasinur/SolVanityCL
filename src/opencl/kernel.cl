@@ -11,6 +11,7 @@ typedef int32_t fe[10];
 
 constant uchar PREFIX[] = {83, 111, 76};
 constant uchar SUFFIX[] = {};
+constant int CASE_SENSITIVE = 1;
 
 static uint64_t load_3(const unsigned char *in) {
   uint64_t result;
@@ -5066,7 +5067,20 @@ __kernel void generate_pubkey(constant uchar *seed, global uchar *out,
   // pattern match
   size_t prefix_len = sizeof(PREFIX), suffix_len = sizeof(SUFFIX);
   for (size_t i = 0; i < suffix_len; i++) {
-    if (addr[length - suffix_len + i] != SUFFIX[i])
+    uchar addr_char = addr[length - suffix_len + i];
+    uchar suffix_char = SUFFIX[i];
+
+    if (CASE_SENSITIVE == 0) {
+      // Convert both characters to uppercase for comparison
+      if (addr_char >= 'a' && addr_char <= 'z') {
+        addr_char -= 32;  // Convert lowercase to uppercase
+      }
+      if (suffix_char >= 'a' && suffix_char <= 'z') {
+        suffix_char -= 32;  // Convert lowercase to uppercase
+      }
+    }
+
+    if (addr_char != suffix_char)
       return;
   }
 
@@ -5074,7 +5088,7 @@ __kernel void generate_pubkey(constant uchar *seed, global uchar *out,
     uchar addr_char = addr[i];
     uchar prefix_char = PREFIX[i];
     
-    if (sizeof(PREFIX) >=5) {
+    if (CASE_SENSITIVE == 0) {
       // Convert both characters to uppercase for comparison
       if (addr_char >= 'a' && addr_char <= 'z') {
         addr_char -= 32;  // Convert lowercase to uppercase
