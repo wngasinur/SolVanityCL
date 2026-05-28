@@ -7,12 +7,15 @@ import sys
 import time
 from datetime import datetime, timedelta
 from math import ceil
-from multiprocessing.pool import Pool
+import multiprocessing as mp
+from multiprocessing import Lock, Value
 
 import pyopencl as cl
 
-os.environ["PYOPENCL_COMPILER_OUTPUT"] = "1"
-os.environ["PYOPENCL_NO_CACHE"] = "TRUE"
+if os.environ.get("SOLVANITYCL_DEBUG_OPENCL"):
+    os.environ["PYOPENCL_COMPILER_OUTPUT"] = "1"
+    os.environ["PYOPENCL_NO_CACHE"] = "TRUE"
+
 from pathlib import Path
 
 import click
@@ -85,22 +88,23 @@ class HostSetting:
         self.kernel_source = kernel_source
 
     def generate_key32(self):
+        iteration_bytes = int(self.iteration_bytes)
         token_bytes = (
-            secrets.token_bytes(32 - self.iteration_bytes)
-            + b"\x00" * self.iteration_bytes
+            secrets.token_bytes(32 - iteration_bytes)
+            + b"\x00" * iteration_bytes
         )
-        key32 = np.array([x for x in token_bytes], dtype=np.ubyte)
-        return key32
+        return np.frombuffer(token_bytes, dtype=np.ubyte).copy()
 
     def increase_key32(self):
-        current_number = int(bytes(self.key32).hex(), base=16)
-        next_number = current_number + (1 << self.iteration_bits)
-        _number_bytes = next_number.to_bytes(32, "big")
-        new_key32 = np.array([x for x in _number_bytes], dtype=np.ubyte)
-        carry_index = 0 - self.iteration_bytes
-        if (new_key32[carry_index] < self.key32[carry_index]) and new_key32[
-            carry_index
-        ] != 0:
+        next_number = int.from_bytes(self.key32.tobytes(), "big") + (
+            1 << self.iteration_bits
+        )
+        new_key32 = np.frombuffer(next_number.to_bytes(32, "big"), dtype=np.ubyte)
+        carry_index = 32 - int(self.iteration_bytes)
+        if (
+            new_key32[carry_index] < self.key32[carry_index]
+            and new_key32[carry_index] != 0
+        ):
             new_key32[carry_index] = 0
 
         self.key32[:] = new_key32
@@ -147,27 +151,58 @@ def get_kernel_source(starts_with: str, ends_with: str, case_sensitive: int, cl)
 
 
 def get_all_gpu_devices():
-    devices = [
-        device
-        for platform in cl.get_platforms()
-        for device in platform.get_devices(device_type=cl.device_type.GPU)
-    ]
+    devices = []
+    for ocl_platform in cl.get_platforms():
+        try:
+            devices.extend(
+                ocl_platform.get_devices(device_type=cl.device_type.GPU)
+            )
+        except cl.LogicError:
+            logging.warning(
+                "Skipping platform %s: no GPU devices available",
+                ocl_platform.name,
+            )
+    if not devices:
+        raise RuntimeError("No OpenCL GPU devices found")
     return [d.int_ptr for d in devices]
 
 
-def multi_gpu_init(index: int, setting: HostSetting):
-    # get all platforms and devices
-    try:
-        searcher = Searcher(
-            kernel_source=setting.kernel_source,
-            index=index,
-            setting=setting,
+_worker_searcher = None
+_worker_counter = Value("i", 0)
+_worker_counter_lock = Lock()
+
+
+def _init_gpu_worker(
+    kernel_source: str, iteration_bits: int, gpu_count: int
+) -> None:
+    global _worker_searcher
+    with _worker_counter_lock:
+        index = _worker_counter.value
+        _worker_counter.value += 1
+
+    if index >= gpu_count:
+        raise RuntimeError(
+            f"Pool worker index {index} exceeds GPU count {gpu_count}"
         )
 
-        return searcher.find()
+    setting = HostSetting(kernel_source, iteration_bits)
+    _worker_searcher = Searcher(
+        kernel_source=kernel_source,
+        index=index,
+        setting=setting,
+        gpu_device_index=index,
+        gpu_count=gpu_count,
+    )
+    logging.info(f"GPU worker {index} initialized")
+
+
+def _gpu_search_batch(key32: np.ndarray) -> np.ndarray:
+    global _worker_searcher
+    try:
+        return _worker_searcher.find(key32)
     except Exception as e:
         logging.exception(e)
-    return [0]
+        return np.zeros(33, dtype=np.ubyte)
 
 
 def save_result(outputs, output_dir):
@@ -199,63 +234,72 @@ def save_result(outputs, output_dir):
 
 class Searcher:
     def __init__(
-        self, *, kernel_source, index: int, setting: HostSetting, context=None
+        self,
+        *,
+        kernel_source,
+        index: int,
+        setting: HostSetting,
+        context=None,
+        device_int_ptr=None,
+        gpu_device_index=None,
+        gpu_count=None,
     ):
-        device_ids = get_all_gpu_devices()
-        # context and command queue
         if context:
             self.context = context
             self.gpu_chunks = 1
         else:
-            self.context = cl.Context(
-                [cl.Device.from_int_ptr(device_ids[index])],
-            )
-            self.gpu_chunks = len(device_ids)
+            if gpu_count is None:
+                raise ValueError("gpu_count is required")
+            if gpu_device_index is not None:
+                device_ids = get_all_gpu_devices()
+                if gpu_device_index >= len(device_ids):
+                    raise RuntimeError(
+                        f"GPU index {gpu_device_index} out of range "
+                        f"(found {len(device_ids)} devices)"
+                    )
+                device = cl.Device.from_int_ptr(device_ids[gpu_device_index])
+            elif device_int_ptr is not None:
+                device = cl.Device.from_int_ptr(device_int_ptr)
+            else:
+                raise ValueError(
+                    "gpu_device_index or device_int_ptr is required"
+                )
+            self.context = cl.Context([device])
+            self.gpu_chunks = gpu_count
         self.command_queue = cl.CommandQueue(self.context)
 
         self.setting = setting
         self.index = index
 
-        # build program and kernel
         program = cl.Program(self.context, kernel_source).build()
-        self.program = program
         self.kernel = cl.Kernel(program, "generate_pubkey")
 
-    def filter_valid_result(self, outputs):
-        valid_outputs = []
-        for output in outputs:
-            if not output[0]:
-                continue
-            valid_outputs.append(output)
-        return valid_outputs
-
-    def find(self):
-        # global global_attempt
-        memobj_key32 = cl.Buffer(
+        self.memobj_key32 = cl.Buffer(self.context, cl.mem_flags.READ_ONLY, 32)
+        self.memobj_output = cl.Buffer(self.context, cl.mem_flags.READ_WRITE, 33)
+        self.memobj_occupied_bytes = cl.Buffer(
             self.context,
             cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-            32 * np.ubyte().itemsize,
-            hostbuf=self.setting.key32,
-        )
-        memobj_output = cl.Buffer(
-            self.context, cl.mem_flags.READ_WRITE, 33 * np.ubyte().itemsize
-        )
-
-        memobj_occupied_bytes = cl.Buffer(
-            self.context,
-            cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR,
             hostbuf=np.array([self.setting.iteration_bytes]),
         )
-        memobj_group_offset = cl.Buffer(
+        self.memobj_group_offset = cl.Buffer(
             self.context,
-            cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR,
+            cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
             hostbuf=np.array([self.index]),
         )
-        output = np.zeros(33, dtype=np.ubyte)
-        self.kernel.set_arg(0, memobj_key32)
-        self.kernel.set_arg(1, memobj_output)
-        self.kernel.set_arg(2, memobj_occupied_bytes)
-        self.kernel.set_arg(3, memobj_group_offset)
+        self._output = np.zeros(33, dtype=np.ubyte)
+        self._zero_output = np.zeros(33, dtype=np.ubyte)
+
+        self.kernel.set_arg(0, self.memobj_key32)
+        self.kernel.set_arg(1, self.memobj_output)
+        self.kernel.set_arg(2, self.memobj_occupied_bytes)
+        self.kernel.set_arg(3, self.memobj_group_offset)
+
+    def find(self, key32=None):
+        if key32 is None:
+            key32 = self.setting.key32
+
+        cl.enqueue_copy(self.command_queue, self.memobj_key32, key32)
+        cl.enqueue_copy(self.command_queue, self.memobj_output, self._zero_output)
 
         st = time.time()
         global_worker_size = self.setting.global_work_size // self.gpu_chunks
@@ -265,12 +309,11 @@ class Searcher:
             (global_worker_size,),
             (self.setting.local_work_size,),
         )
-        cl._enqueue_read_buffer(self.command_queue, memobj_output, output).wait()
-        speed = f"{global_worker_size/ ((time.time() - st) * 10**6):.2f}"
-        # global_attempt += float(speed)
-        logging.info(f"GPU {self.index} Speed: {speed} MH/s")
+        cl.enqueue_copy(self.command_queue, self._output, self.memobj_output).wait()
+        speed = global_worker_size / ((time.time() - st) * 10**6)
+        logging.info(f"GPU {self.index} Speed: {speed:.2f} MH/s")
 
-        return output
+        return self._output.copy()
 
 
 @click.group()
@@ -333,6 +376,7 @@ def search_pubkey(
     iteration_bits: int,
 ):
     """Search Solana vanity pubkey"""
+    global global_attempt
 
     if not starts_with and not ends_with:
         print("Please provides at least [starts with] or [ends with]\n")
@@ -345,8 +389,8 @@ def search_pubkey(
     logging.info(
         f"Searching Solana pubkey that starts with '{starts_with}' and ends with '{ends_with}'"
     )
-    with Pool() as pool:
-        gpu_counts = len(pool.apply(get_all_gpu_devices))
+    gpu_counts = len(get_all_gpu_devices())
+    logging.info(f"Found {gpu_counts} OpenCL GPU(s) in main process")
 
     kernel_source = get_kernel_source(starts_with, ends_with, case_sensitive, cl)
     setting = HostSetting(kernel_source, iteration_bits)
@@ -388,19 +432,44 @@ def search_pubkey(
             context=context,
         )
         while result_count < count:
-            output = searcher.find()
+            output = searcher.find(setting.key32)
+            global_attempt += setting.global_work_size / 1e6
             setting.increase_key32()
             result_count += save_result([output], output_dir)
         return
 
-    with Pool(processes=gpu_counts) as pool:
+    if gpu_counts == 1:
+        logging.info("Using single-GPU in-process search (no multiprocessing)")
+        searcher = Searcher(
+            kernel_source=kernel_source,
+            index=0,
+            setting=setting,
+            gpu_device_index=0,
+            gpu_count=1,
+        )
         while result_count < count:
-            results = pool.starmap(
-                multi_gpu_init, [(x, setting) for x in range(gpu_counts)]
-            )
+            output = searcher.find(setting.key32)
+            global_attempt += setting.global_work_size / 1e6
+            setting.increase_key32()
+            result_count += save_result([output], output_dir)
+        return
+
+    logging.info("Using spawn-based multiprocessing for %s GPUs", gpu_counts)
+    with _worker_counter_lock:
+        _worker_counter.value = 0
+
+    mp_context = mp.get_context("spawn")
+    with mp_context.Pool(
+        processes=gpu_counts,
+        initializer=_init_gpu_worker,
+        initargs=(kernel_source, iteration_bits, gpu_counts),
+    ) as pool:
+        while result_count < count:
+            key32_snapshot = setting.key32.copy()
+            results = pool.map(_gpu_search_batch, [key32_snapshot] * gpu_counts)
+            global_attempt += setting.global_work_size / 1e6
             result_count += save_result(results, output_dir)
             setting.increase_key32()
-            time.sleep(0.1)
 
 
 @cli.command(context_settings={"show_default": True})
@@ -409,10 +478,14 @@ def show_device():
 
     platforms = cl.get_platforms()
 
-    for p_index, platform in enumerate(platforms):
-        print(f"Platform {p_index}: {platform.name}")
+    for p_index, ocl_platform in enumerate(platforms):
+        print(f"Platform {p_index}: {ocl_platform.name}")
 
-        devices = platform.get_devices()
+        try:
+            devices = ocl_platform.get_devices()
+        except cl.LogicError as e:
+            print(f"- Failed to enumerate devices: {e}")
+            continue
 
         for d_index, device in enumerate(devices):
             print(f"- Device {d_index}: {device.name}")
