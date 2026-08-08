@@ -1,5 +1,6 @@
 import json
 import logging
+import multiprocessing as mp
 import os
 import platform
 import secrets
@@ -7,7 +8,6 @@ import sys
 import time
 from datetime import datetime, timedelta
 from math import ceil
-import multiprocessing as mp
 from multiprocessing import Lock, Value
 
 import pyopencl as cl
@@ -35,12 +35,21 @@ from message import r
 runpod.api_key = os.environ["RUNPOD_API_KEY"]
 
 global_attempt = 0
+current_hash_rate = 0.0
 terminate_time = datetime.now()
 topic = os.environ["TOPIC"]
-chars = os.environ["CHARS"]
+# "O" means empty / not set (matches existing RunPod convention)
+prefix = os.environ.get("PREFIX", "O")
+suffix = os.environ.get("SUFFIX", "O")
+case_sensitive = os.environ.get("CASE_SENSITIVE", "1")
 terminate_seconds = int(os.environ["TERMINATE_SECONDS"])
+iteration_bits_default = int(os.environ.get("ITERATION_BITS", "26"))
 print("Version 1.0")
-print(f"Subscriber topic {topic}, terminating in {terminate_seconds} seconds")
+print(
+    f"Subscriber topic {topic}, prefix={prefix}, suffix={suffix}, "
+    f"case_sensitive={case_sensitive}, terminating in {terminate_seconds} seconds, "
+    f"iteration_bits={iteration_bits_default}"
+)
 logging.basicConfig(level="INFO", format="[%(levelname)s %(asctime)s] %(message)s")
 
 
@@ -60,11 +69,13 @@ x1.start()
 def publish(message, state=None):
     try:
         # start/timeout/error/warning/progress/completed
-        previous_state = r.get(f"runpod-{topic}-{chars}-stat")
+        previous_state = r.get(
+            f"runpod-{topic}-{prefix}-{suffix}-{case_sensitive}-stat"
+        )
         if state != "completed" and previous_state == b"completed":
             raise RuntimeError("Already completed")
         elif state is not None:
-            r.set(f"runpod-{topic}-{chars}-stat", state)
+            r.set(f"runpod-{topic}-{prefix}-{suffix}-{case_sensitive}-stat", state)
             if state == "completed":
                 r.set(f"runpod-{topic}-last", message)
 
@@ -90,8 +101,7 @@ class HostSetting:
     def generate_key32(self):
         iteration_bytes = int(self.iteration_bytes)
         token_bytes = (
-            secrets.token_bytes(32 - iteration_bytes)
-            + b"\x00" * iteration_bytes
+            secrets.token_bytes(32 - iteration_bytes) + b"\x00" * iteration_bytes
         )
         return np.frombuffer(token_bytes, dtype=np.ubyte).copy()
 
@@ -154,9 +164,7 @@ def get_all_gpu_devices():
     devices = []
     for ocl_platform in cl.get_platforms():
         try:
-            devices.extend(
-                ocl_platform.get_devices(device_type=cl.device_type.GPU)
-            )
+            devices.extend(ocl_platform.get_devices(device_type=cl.device_type.GPU))
         except cl.LogicError:
             logging.warning(
                 "Skipping platform %s: no GPU devices available",
@@ -172,18 +180,14 @@ _worker_counter = Value("i", 0)
 _worker_counter_lock = Lock()
 
 
-def _init_gpu_worker(
-    kernel_source: str, iteration_bits: int, gpu_count: int
-) -> None:
+def _init_gpu_worker(kernel_source: str, iteration_bits: int, gpu_count: int) -> None:
     global _worker_searcher
     with _worker_counter_lock:
         index = _worker_counter.value
         _worker_counter.value += 1
 
     if index >= gpu_count:
-        raise RuntimeError(
-            f"Pool worker index {index} exceeds GPU count {gpu_count}"
-        )
+        raise RuntimeError(f"Pool worker index {index} exceeds GPU count {gpu_count}")
 
     setting = HostSetting(kernel_source, iteration_bits)
     _worker_searcher = Searcher(
@@ -261,9 +265,7 @@ class Searcher:
             elif device_int_ptr is not None:
                 device = cl.Device.from_int_ptr(device_int_ptr)
             else:
-                raise ValueError(
-                    "gpu_device_index or device_int_ptr is required"
-                )
+                raise ValueError("gpu_device_index or device_int_ptr is required")
             self.context = cl.Context([device])
             self.gpu_chunks = gpu_count
         self.command_queue = cl.CommandQueue(self.context)
@@ -301,7 +303,6 @@ class Searcher:
         cl.enqueue_copy(self.command_queue, self.memobj_key32, key32)
         cl.enqueue_copy(self.command_queue, self.memobj_output, self._zero_output)
 
-        st = time.time()
         global_worker_size = self.setting.global_work_size // self.gpu_chunks
         cl.enqueue_nd_range_kernel(
             self.command_queue,
@@ -310,8 +311,6 @@ class Searcher:
             (self.setting.local_work_size,),
         )
         cl.enqueue_copy(self.command_queue, self._output, self.memobj_output).wait()
-        speed = global_worker_size / ((time.time() - st) * 10**6)
-        logging.info(f"GPU {self.index} Speed: {speed:.2f} MH/s")
 
         return self._output.copy()
 
@@ -361,8 +360,11 @@ def cli():
 @click.option(
     "--iteration-bits",
     type=int,
-    help="Number of the iteration occupied bits. Recommended 24, 26, 28, 30, 32. The larger the bits, the longer it takes to complete an iteration.",
-    default=24,
+    help=(
+        "Number of iteration occupied bits. Recommended 24, 26, 28, 30, 32. "
+        "Larger bits = longer batch. Defaults to ITERATION_BITS env var, else 26."
+    ),
+    default=None,
 )
 @click.pass_context
 def search_pubkey(
@@ -378,6 +380,24 @@ def search_pubkey(
     """Search Solana vanity pubkey"""
     global global_attempt
 
+    if iteration_bits is None:
+        iteration_bits = iteration_bits_default
+    if iteration_bits < 16 or iteration_bits > 32:
+        logging.error(
+            "iteration-bits must be between 16 and 32 (got %s)", iteration_bits
+        )
+        publish(
+            json.dumps(
+                {
+                    "state": "error",
+                    "message": f"invalid iteration-bits: {iteration_bits}",
+                }
+            ),
+            "error",
+        )
+        runpod.terminate_pod(os.environ["RUNPOD_POD_ID"])
+        sys.exit(1)
+
     if not starts_with and not ends_with:
         print("Please provides at least [starts with] or [ends with]\n")
         click.echo(ctx.get_help())
@@ -387,7 +407,8 @@ def search_pubkey(
     check_character("ends_with", ends_with)
 
     logging.info(
-        f"Searching Solana pubkey that starts with '{starts_with}' and ends with '{ends_with}'"
+        f"Searching Solana pubkey that starts with '{starts_with}' and ends with '{ends_with}' "
+        f"(iteration_bits={iteration_bits}, batch={1 << iteration_bits})"
     )
     gpu_counts = len(get_all_gpu_devices())
     logging.info(f"Found {gpu_counts} OpenCL GPU(s) in main process")
@@ -400,7 +421,7 @@ def search_pubkey(
     publish(json.dumps({"state": "progress"}), "progress")
 
     def heartbeat_function():
-        global global_attempt, terminate_time, terminate_seconds
+        global global_attempt, current_hash_rate, terminate_time, terminate_seconds
         while True:
             y = terminate_time - datetime.now()
             elapsedTime = terminate_seconds - y.seconds
@@ -410,18 +431,33 @@ def search_pubkey(
                         "attempt": str(round(global_attempt, 2)),
                         "elapsedTime": elapsedTime,
                         "maxTime": terminate_seconds,
+                        "hashRate": round(current_hash_rate, 2),
                     }
                 )
             )
-            if len(chars) >= 6:
+            chars = len("" if prefix == "O" else prefix) + len(
+                "" if suffix == "O" else suffix
+            )
+            if chars >= 6:
                 time.sleep(30)
-            elif len(chars) >= 5:
-                time.sleep(15)
+            elif chars >= 5:
+                time.sleep(20)
             else:
                 time.sleep(7)
 
     x2 = threading.Thread(target=heartbeat_function, daemon=True)
     x2.start()
+
+    def run_batch(batch_fn):
+        global global_attempt, current_hash_rate
+        st = time.time()
+        output = batch_fn()
+        elapsed = time.time() - st
+        attempts = setting.global_work_size / 1e6
+        if elapsed > 0:
+            current_hash_rate = attempts / elapsed
+        global_attempt += attempts
+        return output
 
     if select_device:
         context = cl.create_some_context()
@@ -432,8 +468,7 @@ def search_pubkey(
             context=context,
         )
         while result_count < count:
-            output = searcher.find(setting.key32)
-            global_attempt += setting.global_work_size / 1e6
+            output = run_batch(lambda: searcher.find(setting.key32))
             setting.increase_key32()
             result_count += save_result([output], output_dir)
         return
@@ -448,8 +483,7 @@ def search_pubkey(
             gpu_count=1,
         )
         while result_count < count:
-            output = searcher.find(setting.key32)
-            global_attempt += setting.global_work_size / 1e6
+            output = run_batch(lambda: searcher.find(setting.key32))
             setting.increase_key32()
             result_count += save_result([output], output_dir)
         return
@@ -466,8 +500,9 @@ def search_pubkey(
     ) as pool:
         while result_count < count:
             key32_snapshot = setting.key32.copy()
-            results = pool.map(_gpu_search_batch, [key32_snapshot] * gpu_counts)
-            global_attempt += setting.global_work_size / 1e6
+            results = run_batch(
+                lambda: pool.map(_gpu_search_batch, [key32_snapshot] * gpu_counts)
+            )
             result_count += save_result(results, output_dir)
             setting.increase_key32()
 
